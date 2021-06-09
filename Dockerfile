@@ -1,6 +1,24 @@
+#
+# Build go project
+#
+FROM golang:1.15-alpine as go-builder
+
+WORKDIR /build
+
+COPY . .
+
+RUN apk add -u -t build-tools curl git && \
+    CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo && \
+    apk del build-tools && \
+    rm -rf /var/cache/apk/*
+
+#
+# Runtime container
+#
+
 FROM golang:alpine 
 RUN mkdir /app
-ADD rds-snapshot-restore /app
+COPY --from=go-builder /build/rds-snapshot-restore /app
 ADD entrypoint.sh /app
 WORKDIR /app
 RUN apk add --update curl bash ca-certificates && \

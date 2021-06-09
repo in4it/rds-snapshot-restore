@@ -28,6 +28,7 @@ func main() {
 		securitygroup          string
 		restoredmasterpassword string
 		dbparametergroup       string
+		dbType                 string
 		err                    error
 	)
 	flag.StringVar(&databaseName, "database", "", "The source database")
@@ -36,6 +37,7 @@ func main() {
 	flag.StringVar(&securitygroup, "securitygroup", "", "The securitygroup of the restored RDS")
 	flag.StringVar(&restoredmasterpassword, "restoredmasterpassword", "", "The desired password of the restored RDS")
 	flag.StringVar(&dbparametergroup, "dbparametergroup", "", "The desired db parametergroup of the restored RDS")
+	flag.StringVar(&dbType, "dbtype", "", "The desired db type of the restored RDS")
 
 	flag.Parse()
 
@@ -89,7 +91,7 @@ func main() {
 	}
 
 	fmt.Println("Changing restored database parameters...")
-	err = changeDBInstance(dbr, region, securitygroup, restoredmasterpassword, dbparametergroup)
+	err = changeDBInstance(dbr, region, securitygroup, restoredmasterpassword, dbparametergroup, dbType)
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -204,14 +206,14 @@ func restoreDBInstanceToPointInTime(t time.Time, db string, dbr string, region s
 }
 
 //Change rds instance type
-func changeDBInstance(dbr string, region string, securitygroup string, restoredmasterpassword string, dbparametergroup string) error {
+func changeDBInstance(dbr string, region string, securitygroup string, restoredmasterpassword string, dbparametergroup string, dbType string) error {
 	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
 	input := &rds.ModifyDBInstanceInput{
 		DBInstanceIdentifier:  aws.String(dbr),
 		ApplyImmediately:      aws.Bool(true),
 		PubliclyAccessible:    aws.Bool(true),
 		BackupRetentionPeriod: aws.Int64(0),
-		DBInstanceClass:       aws.String("db.t3.micro"),
+		DBInstanceClass:       aws.String(dbType),
 		MasterUserPassword:    aws.String(restoredmasterpassword),
 		MultiAZ:               aws.Bool(false),
 		VpcSecurityGroupIds:   aws.StringSlice([]string{securitygroup}),
