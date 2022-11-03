@@ -1,12 +1,12 @@
 # RDS snapshot restore
 
-The goal of this tool is to automate the restore/creation/RDS modifications process. This was developed to give the client access to recent production data(start of script -10 min nowSubstractTenMinutes) without impacting production and leveraging the snapshots and AWS RDS point in time restore capabilities. 
+The goal of rds-snapshot-restore is to automate the AWS RDS restore/creation/modifications process. This without impacting production and leveraging the AWS snapshot and point in time restore capabilities. 
 
-#Remarks
+# Remarks
 
-* Make sure the deletenion protection is on on the databases with the `-database=` parameter
-* provide a valid security group id, if the database is marked publicly make sure the SG is created in the correct VPC
-* this script wil delete the previously created database `-restoretargetdatabase=`
+* Make sure the deletion protection is on
+* Provide a valid security group id. If the database is marked publicly make sure the SG is created in the correct VPC
+* This script wil delete the previously created database `-restoretargetdatabase=`
 
 *Example to run command:*
 ```
