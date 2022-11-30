@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/rds"
 )
@@ -29,8 +30,10 @@ func main() {
 		restoredmasterpassword string
 		dbparametergroup       string
 		dbType                 string
+		waitingDbTimeInMinutes int
 		err                    error
 	)
+	const defaultWaitingDbTimeInMinutes = 30
 	flag.StringVar(&databaseName, "database", "", "The source database")
 	flag.StringVar(&restoreTargetDatabase, "restoretargetdatabase", "", "The target name of the restored database")
 	flag.StringVar(&region, "region", "", "The region of the aws resources")
@@ -38,6 +41,7 @@ func main() {
 	flag.StringVar(&restoredmasterpassword, "restoredmasterpassword", "", "The desired password of the restored RDS")
 	flag.StringVar(&dbparametergroup, "dbparametergroup", "", "The desired db parametergroup of the restored RDS")
 	flag.StringVar(&dbType, "dbtype", "", "The desired db type of the restored RDS")
+	flag.IntVar(&waitingDbTimeInMinutes, "waitingDbTimeInMinutes", defaultWaitingDbTimeInMinutes, "The desired waiting time in minutes for the restored RDS. This is required to apply the changes to the restored RDS")
 
 	flag.Parse()
 
@@ -58,6 +62,9 @@ func main() {
 	}
 	if dbparametergroup != "" {
 		os.Setenv("dbparametergroup", dbparametergroup)
+	}
+	if waitingDbTimeInMinutes != defaultWaitingDbTimeInMinutes {
+		os.Setenv("waitingDbTimeInMinutes", string(rune(waitingDbTimeInMinutes)))
 	}
 
 	t := time.Now()
@@ -84,7 +91,7 @@ func main() {
 	fmt.Println(restoreresult)
 
 	fmt.Println("Waiting for instance to become available...")
-	err = waitDBInstanceAvailable(dbr, region)
+	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -97,7 +104,7 @@ func main() {
 	}
 
 	fmt.Println("Waiting for instance to become available...")
-	err = waitDBInstanceAvailable(dbr, region)
+	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -110,7 +117,7 @@ func main() {
 	}
 
 	fmt.Println("Waiting for instance to become available...")
-	err = waitDBInstanceAvailable(dbr, region)
+	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -144,13 +151,17 @@ func waitDBInstanceDeleted(dbr string, region string) error {
 }
 
 //Wait for db to become available
-func waitDBInstanceAvailable(dbr string, region string) error {
+func waitDBInstanceAvailable(dbr string, region string, waitingDbTimeInMinutes int) error {
 	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
 	input := &rds.DescribeDBInstancesInput{
 		DBInstanceIdentifier: aws.String(dbr),
 	}
 
-	err := svc.WaitUntilDBInstanceAvailable(input)
+	err := svc.WaitUntilDBInstanceAvailableWithContext(
+		aws.BackgroundContext(),
+		input,
+		request.WithWaiterDelay(request.ConstantWaiterDelay(30*time.Second)), // check every 30 seconds
+		request.WithWaiterMaxAttempts(waitingDbTimeInMinutes*2))              // waiting time in minutes (depends on the previous line)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
 			fmt.Println(aerr.Error())
