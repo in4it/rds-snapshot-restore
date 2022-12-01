@@ -33,7 +33,7 @@ func main() {
 		waitingDbTimeInMinutes int
 		err                    error
 	)
-	const defaultWaitingDbTimeInMinutes = 30
+	const defaultWaitingDbTimeInMinutes = 35 // the default RDS backup duration is 30 minutes. Hence, we need to wait a bit more than 30 minutes
 	flag.StringVar(&databaseName, "database", "", "The source database")
 	flag.StringVar(&restoreTargetDatabase, "restoretargetdatabase", "", "The target name of the restored database")
 	flag.StringVar(&region, "region", "", "The region of the aws resources")
@@ -67,7 +67,6 @@ func main() {
 		os.Setenv("waitingDbTimeInMinutes", string(rune(waitingDbTimeInMinutes)))
 	}
 
-	t := time.Now()
 	db := databaseName
 	dbr := restoreTargetDatabase
 
@@ -83,7 +82,7 @@ func main() {
 	}
 
 	fmt.Println("Creating restored DB instance")
-	restoreresult, err := restoreDBInstanceToPointInTime(t, db, dbr, region)
+	restoreresult, err := restoreDBInstanceToPointInTime(db, dbr, region, dbType, securitygroup, dbparametergroup)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -98,7 +97,7 @@ func main() {
 	}
 
 	fmt.Println("Changing restored database parameters...")
-	err = changeDBInstance(dbr, region, securitygroup, restoredmasterpassword, dbparametergroup, dbType)
+	err = changeDBInstance(dbr, region, restoredmasterpassword)
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -194,7 +193,7 @@ func deleteRestoredDBInstance(dbr string, region string) (bool, error) {
 }
 
 //Restores database
-func restoreDBInstanceToPointInTime(t time.Time, db string, dbr string, region string) (bool, error) {
+func restoreDBInstanceToPointInTime(db string, dbr string, region string, dbType string, securitygroup string, dbparametergroup string) (bool, error) {
 	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
 	now := time.Now()
 	nowSubstractTenMinutes := now.Add(-10 * time.Minute)
@@ -202,6 +201,12 @@ func restoreDBInstanceToPointInTime(t time.Time, db string, dbr string, region s
 		RestoreTime:                aws.Time(nowSubstractTenMinutes),
 		SourceDBInstanceIdentifier: aws.String(db),
 		TargetDBInstanceIdentifier: aws.String(dbr),
+		PubliclyAccessible:         aws.Bool(true),
+		DBInstanceClass:            aws.String(dbType),
+		MultiAZ:                    aws.Bool(false),
+		VpcSecurityGroupIds:        aws.StringSlice([]string{securitygroup}),
+		DBParameterGroupName:       aws.String(dbparametergroup),
+		AutoMinorVersionUpgrade:    aws.Bool(false),
 	}
 
 	_, err := svc.RestoreDBInstanceToPointInTime(input)
@@ -216,19 +221,14 @@ func restoreDBInstanceToPointInTime(t time.Time, db string, dbr string, region s
 	return true, nil
 }
 
-//Change rds instance type
-func changeDBInstance(dbr string, region string, securitygroup string, restoredmasterpassword string, dbparametergroup string, dbType string) error {
+//Change rds instance type (change master user password and disable backups)
+func changeDBInstance(dbr string, region string, restoredmasterpassword string) error {
 	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
 	input := &rds.ModifyDBInstanceInput{
 		DBInstanceIdentifier:  aws.String(dbr),
 		ApplyImmediately:      aws.Bool(true),
-		PubliclyAccessible:    aws.Bool(true),
-		BackupRetentionPeriod: aws.Int64(0),
-		DBInstanceClass:       aws.String(dbType),
+		BackupRetentionPeriod: aws.Int64(0), // prevent backups
 		MasterUserPassword:    aws.String(restoredmasterpassword),
-		MultiAZ:               aws.Bool(false),
-		VpcSecurityGroupIds:   aws.StringSlice([]string{securitygroup}),
-		DBParameterGroupName:  aws.String(dbparametergroup),
 	}
 
 	_, err := svc.ModifyDBInstance(input)
