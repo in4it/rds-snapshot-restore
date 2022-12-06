@@ -22,6 +22,10 @@ func parseTime(layout, value string) *time.Time {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	var (
 		databaseName           string
 		restoreTargetDatabase  string
@@ -85,7 +89,7 @@ func main() {
 	restoreresult, err := restoreDBInstanceToPointInTime(db, dbr, region, dbType, securitygroup, dbparametergroup)
 	if err != nil {
 		printError(err)
-		return
+		return 1
 	}
 	printInfo(restoreresult)
 
@@ -93,7 +97,7 @@ func main() {
 	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
 		printError(err)
-		return
+		return 1
 	}
 
 	printInfo("Changing restored database parameters...")
@@ -106,7 +110,7 @@ func main() {
 	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
 		printError(err)
-		return
+		return 1
 	}
 
 	printInfo("Restarting restored database...")
@@ -119,7 +123,7 @@ func main() {
 	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
 		printError(err)
-		return
+		return 1
 	}
 
 	//	printInfo("cleaning up tests")
@@ -128,6 +132,7 @@ func main() {
 	//		printError(err)
 	//	}
 	//	printInfo(deleteresultafter)
+	return 0
 }
 
 //Wait for old db to be deleted
