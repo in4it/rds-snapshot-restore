@@ -22,6 +22,10 @@ func parseTime(layout, value string) *time.Time {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	var (
 		databaseName           string
 		restoreTargetDatabase  string
@@ -70,64 +74,65 @@ func main() {
 	db := databaseName
 	dbr := restoreTargetDatabase
 
-	fmt.Println("Deleting previous restored DB instance")
+	printInfo("Deleting previous restored DB instance")
 	deleteresult, err := deleteRestoredDBInstance(dbr, region)
 	if err == nil {
-		fmt.Println(deleteresult)
-		fmt.Println("Waiting for instance to be deleted...")
+		printInfo(deleteresult)
+		printInfo("Waiting for instance to be deleted...")
 		err = waitDBInstanceDeleted(dbr, region)
 	}
 	if err != nil {
-		fmt.Println("Previous restored DB instance doesn't exist")
+		printError("Previous restored DB instance doesn't exist")
 	}
 
-	fmt.Println("Creating restored DB instance")
+	printInfo("Creating restored DB instance")
 	restoreresult, err := restoreDBInstanceToPointInTime(db, dbr, region, dbType, securitygroup, dbparametergroup)
 	if err != nil {
-		fmt.Println(err)
-		return
+		printError(err)
+		return 1
 	}
-	fmt.Println(restoreresult)
+	printInfo(restoreresult)
 
-	fmt.Println("Waiting for instance to become available...")
+	printInfo("Waiting for instance to become available...")
 	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
-		fmt.Println(err)
-		return
+		printError(err)
+		return 1
 	}
 
-	fmt.Println("Changing restored database parameters...")
+	printInfo("Changing restored database parameters...")
 	err = changeDBInstance(dbr, region, restoredmasterpassword)
 	if err != nil {
-		fmt.Println(err)
+		printError(err)
 	}
 
-	fmt.Println("Waiting for instance to become available...")
+	printInfo("Waiting for instance to become available...")
 	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
-		fmt.Println(err)
-		return
+		printError(err)
+		return 1
 	}
 
-	fmt.Println("Restarting restored database...")
+	printInfo("Restarting restored database...")
 	err = restartDBInstance(dbr, region)
 	if err != nil {
-		fmt.Println(err)
+		printError(err)
 	}
 
-	fmt.Println("Waiting for instance to become available...")
+	printInfo("Waiting for instance to become available...")
 	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
 	if err != nil {
-		fmt.Println(err)
-		return
+		printError(err)
+		return 1
 	}
 
-	//	fmt.Println("cleaning up tests")
+	//	printInfo("cleaning up tests")
 	//	deleteresultafter, err := deleteRestoredDBInstance(dbr, region)
 	//	if err != nil {
-	//		fmt.Println(err)
+	//		printError(err)
 	//	}
-	//	fmt.Println(deleteresultafter)
+	//	printInfo(deleteresultafter)
+	return 0
 }
 
 //Wait for old db to be deleted
@@ -140,9 +145,9 @@ func waitDBInstanceDeleted(dbr string, region string) error {
 	err := svc.WaitUntilDBInstanceDeleted(input)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			fmt.Println(aerr.Error())
+			printError(aerr.Error())
 		} else {
-			fmt.Println(err.Error())
+			printError(err.Error())
 		}
 		return err
 	}
@@ -163,9 +168,9 @@ func waitDBInstanceAvailable(dbr string, region string, waitingDbTimeInMinutes i
 		request.WithWaiterMaxAttempts(waitingDbTimeInMinutes*2))              // waiting time in minutes (depends on the previous line)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			fmt.Println(aerr.Error())
+			printError(aerr.Error())
 		} else {
-			fmt.Println(err.Error())
+			printError(err.Error())
 		}
 		return err
 	}
@@ -183,9 +188,9 @@ func deleteRestoredDBInstance(dbr string, region string) (bool, error) {
 	_, err := svc.DeleteDBInstance(deleteinput)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			fmt.Println(aerr.Error())
+			printError(aerr.Error())
 		} else {
-			fmt.Println(err.Error())
+			printError(err.Error())
 		}
 		return false, err
 	}
@@ -212,9 +217,9 @@ func restoreDBInstanceToPointInTime(db string, dbr string, region string, dbType
 	_, err := svc.RestoreDBInstanceToPointInTime(input)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			fmt.Println(aerr.Error())
+			printError(aerr.Error())
 		} else {
-			fmt.Println(err.Error())
+			printError(err.Error())
 		}
 		return false, err
 	}
@@ -235,9 +240,9 @@ func changeDBInstance(dbr string, region string, restoredmasterpassword string) 
 	time.Sleep(15 * time.Second)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			fmt.Println(aerr.Error())
+			printError(aerr.Error())
 		} else {
-			fmt.Println(err.Error())
+			printError(err.Error())
 		}
 		return err
 	}
@@ -254,11 +259,19 @@ func restartDBInstance(dbr string, region string) error {
 	time.Sleep(15 * time.Second)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			fmt.Println(aerr.Error())
+			printError(aerr.Error())
 		} else {
-			fmt.Println(err.Error())
+			printError(err.Error())
 		}
 		return err
 	}
 	return nil
+}
+
+func printError(a ...interface{}) {
+	fmt.Println("ERROR:", a)
+}
+
+func printInfo(a ...interface{}) {
+	fmt.Println("INFO:", a)
 }
