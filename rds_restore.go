@@ -1,25 +1,22 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/rds"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
+	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 )
-
-func parseTime(layout, value string) *time.Time {
-	t, err := time.Parse(layout, value)
-	if err != nil {
-		panic(err)
-	}
-	return &t
-}
 
 func main() {
 	os.Exit(run())
@@ -35,7 +32,7 @@ func run() int {
 		dbparametergroup       string
 		dbType                 string
 		waitingDbTimeInMinutes int
-		err                    error
+		targetRoleARN          string
 	)
 	const defaultWaitingDbTimeInMinutes = 35 // the default RDS backup duration is 30 minutes. Hence, we need to wait a bit more than 30 minutes
 	flag.StringVar(&databaseName, "database", "", "The source database")
@@ -46,6 +43,7 @@ func run() int {
 	flag.StringVar(&dbparametergroup, "dbparametergroup", "", "The desired db parametergroup of the restored RDS")
 	flag.StringVar(&dbType, "dbtype", "", "The desired db type of the restored RDS")
 	flag.IntVar(&waitingDbTimeInMinutes, "waitingDbTimeInMinutes", defaultWaitingDbTimeInMinutes, "The desired waiting time in minutes for the restored RDS. This is required to apply the changes to the restored RDS")
+	flag.StringVar(&targetRoleARN, "target-role-arn", "", "IAM role ARN in the target account to assume for cross-account restore (e.g. arn:aws:iam::123456789012:role/RDSRestoreRole)")
 
 	flag.Parse()
 
@@ -71,22 +69,35 @@ func run() int {
 		os.Setenv("waitingDbTimeInMinutes", string(rune(waitingDbTimeInMinutes)))
 	}
 
-	db := databaseName
-	dbr := restoreTargetDatabase
+	ctx := context.Background()
 
+	sourceCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		printError(err)
+		return 1
+	}
+
+	if targetRoleARN != "" {
+		return runCrossAccount(ctx, databaseName, restoreTargetDatabase, dbType, securitygroup, dbparametergroup, restoredmasterpassword, targetRoleARN, waitingDbTimeInMinutes, sourceCfg)
+	}
+
+	return runSameAccount(ctx, databaseName, restoreTargetDatabase, dbType, securitygroup, dbparametergroup, restoredmasterpassword, waitingDbTimeInMinutes, sourceCfg)
+}
+
+func runSameAccount(ctx context.Context, db, dbr, dbType, securitygroup, dbparametergroup, restoredmasterpassword string, waitingDbTimeInMinutes int, cfg aws.Config) int {
 	printInfo("Deleting previous restored DB instance")
-	deleteresult, err := deleteRestoredDBInstance(dbr, region)
+	deleteresult, err := deleteRestoredDBInstance(ctx, dbr, cfg)
 	if err == nil {
 		printInfo(deleteresult)
 		printInfo("Waiting for instance to be deleted...")
-		err = waitDBInstanceDeleted(dbr, region)
+		err = waitDBInstanceDeleted(ctx, dbr, cfg)
 	}
 	if err != nil {
 		printError("Previous restored DB instance doesn't exist")
 	}
 
 	printInfo("Creating restored DB instance")
-	restoreresult, err := restoreDBInstanceToPointInTime(db, dbr, region, dbType, securitygroup, dbparametergroup)
+	restoreresult, err := restoreDBInstanceToPointInTime(ctx, db, dbr, dbType, securitygroup, dbparametergroup, cfg)
 	if err != nil {
 		printError(err)
 		return 1
@@ -94,178 +105,285 @@ func run() int {
 	printInfo(restoreresult)
 
 	printInfo("Waiting for instance to become available...")
-	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
-	if err != nil {
+	if err = waitDBInstanceAvailable(ctx, dbr, waitingDbTimeInMinutes, cfg); err != nil {
 		printError(err)
 		return 1
 	}
 
 	printInfo("Changing restored database parameters...")
-	err = changeDBInstance(dbr, region, restoredmasterpassword)
-	if err != nil {
+	if err = changeDBInstance(ctx, dbr, restoredmasterpassword, cfg); err != nil {
 		printError(err)
 	}
 
 	printInfo("Waiting for instance to become available...")
-	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
-	if err != nil {
+	if err = waitDBInstanceAvailable(ctx, dbr, waitingDbTimeInMinutes, cfg); err != nil {
 		printError(err)
 		return 1
 	}
 
 	printInfo("Restarting restored database...")
-	err = restartDBInstance(dbr, region)
-	if err != nil {
+	if err = restartDBInstance(ctx, dbr, cfg); err != nil {
 		printError(err)
 	}
 
 	printInfo("Waiting for instance to become available...")
-	err = waitDBInstanceAvailable(dbr, region, waitingDbTimeInMinutes)
+	if err = waitDBInstanceAvailable(ctx, dbr, waitingDbTimeInMinutes, cfg); err != nil {
+		printError(err)
+		return 1
+	}
+
+	return 0
+}
+
+// runCrossAccount creates a manual snapshot in the source account, shares it with the
+// target account, assumes the target role, and restores the DB there.
+func runCrossAccount(ctx context.Context, db, dbr, dbType, securitygroup, dbparametergroup, restoredmasterpassword, targetRoleARN string, waitingDbTimeInMinutes int, sourceCfg aws.Config) int {
+	targetAccountID, err := accountIDFromRoleARN(targetRoleARN)
 	if err != nil {
 		printError(err)
 		return 1
 	}
 
-	//	printInfo("cleaning up tests")
-	//	deleteresultafter, err := deleteRestoredDBInstance(dbr, region)
-	//	if err != nil {
-	//		printError(err)
-	//	}
-	//	printInfo(deleteresultafter)
+	sourceAccountID, err := getCallerAccountID(ctx, sourceCfg)
+	if err != nil {
+		printError(err)
+		return 1
+	}
+
+	snapshotID := fmt.Sprintf("%s-cross-account-%d", db, time.Now().Unix())
+
+	printInfo("Creating snapshot in source account:", snapshotID)
+	if err = createDBSnapshot(ctx, db, snapshotID, sourceCfg); err != nil {
+		printError(err)
+		return 1
+	}
+
+	printInfo("Waiting for snapshot to become available...")
+	if err = waitDBSnapshotAvailable(ctx, snapshotID, sourceCfg); err != nil {
+		printError(err)
+		return 1
+	}
+
+	printInfo("Sharing snapshot with target account:", targetAccountID)
+	if err = shareDBSnapshot(ctx, snapshotID, targetAccountID, sourceCfg); err != nil {
+		printError(err)
+		return 1
+	}
+
+	snapshotARN := fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", sourceCfg.Region, sourceAccountID, snapshotID)
+
+	// Build a config for the target account by assuming the provided role
+	stsClient := sts.NewFromConfig(sourceCfg)
+	targetCfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(sourceCfg.Region),
+		config.WithCredentialsProvider(aws.NewCredentialsCache(
+			stscreds.NewAssumeRoleProvider(stsClient, targetRoleARN),
+		)),
+	)
+	if err != nil {
+		printError(err)
+		return 1
+	}
+
+	printInfo("Deleting previous restored DB instance in target account")
+	deleteresult, err := deleteRestoredDBInstance(ctx, dbr, targetCfg)
+	if err == nil {
+		printInfo(deleteresult)
+		printInfo("Waiting for instance to be deleted...")
+		err = waitDBInstanceDeleted(ctx, dbr, targetCfg)
+	}
+	if err != nil {
+		printError("Previous restored DB instance doesn't exist")
+	}
+
+	printInfo("Restoring DB from shared snapshot in target account")
+	if err = restoreDBInstanceFromSnapshot(ctx, snapshotARN, dbr, dbType, securitygroup, dbparametergroup, targetCfg); err != nil {
+		printError(err)
+		return 1
+	}
+
+	printInfo("Waiting for instance to become available...")
+	if err = waitDBInstanceAvailable(ctx, dbr, waitingDbTimeInMinutes, targetCfg); err != nil {
+		printError(err)
+		return 1
+	}
+
+	printInfo("Changing restored database parameters...")
+	if err = changeDBInstance(ctx, dbr, restoredmasterpassword, targetCfg); err != nil {
+		printError(err)
+	}
+
+	printInfo("Waiting for instance to become available...")
+	if err = waitDBInstanceAvailable(ctx, dbr, waitingDbTimeInMinutes, targetCfg); err != nil {
+		printError(err)
+		return 1
+	}
+
+	printInfo("Restarting restored database...")
+	if err = restartDBInstance(ctx, dbr, targetCfg); err != nil {
+		printError(err)
+	}
+
+	printInfo("Waiting for instance to become available...")
+	if err = waitDBInstanceAvailable(ctx, dbr, waitingDbTimeInMinutes, targetCfg); err != nil {
+		printError(err)
+		return 1
+	}
+
 	return 0
 }
 
-//Wait for old db to be deleted
-func waitDBInstanceDeleted(dbr string, region string) error {
-	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
-	input := &rds.DescribeDBInstancesInput{
-		DBInstanceIdentifier: aws.String(dbr),
+func accountIDFromRoleARN(roleARN string) (string, error) {
+	// arn:aws:iam::123456789012:role/RoleName
+	parts := strings.Split(roleARN, ":")
+	if len(parts) < 5 {
+		return "", fmt.Errorf("invalid role ARN: %s", roleARN)
 	}
-
-	err := svc.WaitUntilDBInstanceDeleted(input)
-	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			printError(aerr.Error())
-		} else {
-			printError(err.Error())
-		}
-		return err
-	}
-	return nil
+	return parts[4], nil
 }
 
-//Wait for db to become available
-func waitDBInstanceAvailable(dbr string, region string, waitingDbTimeInMinutes int) error {
-	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
-	input := &rds.DescribeDBInstancesInput{
-		DBInstanceIdentifier: aws.String(dbr),
-	}
-
-	err := svc.WaitUntilDBInstanceAvailableWithContext(
-		aws.BackgroundContext(),
-		input,
-		request.WithWaiterDelay(request.ConstantWaiterDelay(30*time.Second)), // check every 30 seconds
-		request.WithWaiterMaxAttempts(waitingDbTimeInMinutes*2))              // waiting time in minutes (depends on the previous line)
+func getCallerAccountID(ctx context.Context, cfg aws.Config) (string, error) {
+	stsClient := sts.NewFromConfig(cfg)
+	result, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			printError(aerr.Error())
-		} else {
-			printError(err.Error())
-		}
-		return err
+		return "", fmt.Errorf("failed to get caller identity: %w", err)
 	}
-	return nil
+	return aws.ToString(result.Account), nil
 }
 
-//Removes Old restored database
-func deleteRestoredDBInstance(dbr string, region string) (bool, error) {
-	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
-	deleteinput := &rds.DeleteDBInstanceInput{
+func createDBSnapshot(ctx context.Context, db, snapshotID string, cfg aws.Config) error {
+	svc := rds.NewFromConfig(cfg)
+	_, err := svc.CreateDBSnapshot(ctx, &rds.CreateDBSnapshotInput{
+		DBInstanceIdentifier: aws.String(db),
+		DBSnapshotIdentifier: aws.String(snapshotID),
+	})
+	return wrapRDSError(err)
+}
+
+func waitDBSnapshotAvailable(ctx context.Context, snapshotID string, cfg aws.Config) error {
+	svc := rds.NewFromConfig(cfg)
+	waiter := rds.NewDBSnapshotAvailableWaiter(svc)
+	err := waiter.Wait(ctx, &rds.DescribeDBSnapshotsInput{
+		DBSnapshotIdentifier: aws.String(snapshotID),
+	}, 60*time.Minute)
+	return wrapRDSError(err)
+}
+
+func shareDBSnapshot(ctx context.Context, snapshotID, targetAccountID string, cfg aws.Config) error {
+	svc := rds.NewFromConfig(cfg)
+	_, err := svc.ModifyDBSnapshotAttribute(ctx, &rds.ModifyDBSnapshotAttributeInput{
+		DBSnapshotIdentifier: aws.String(snapshotID),
+		AttributeName:        aws.String("restore"),
+		ValuesToAdd:          []string{targetAccountID},
+	})
+	return wrapRDSError(err)
+}
+
+func restoreDBInstanceFromSnapshot(ctx context.Context, snapshotARN, dbr, dbType, securitygroup, dbparametergroup string, cfg aws.Config) error {
+	svc := rds.NewFromConfig(cfg)
+	_, err := svc.RestoreDBInstanceFromDBSnapshot(ctx, &rds.RestoreDBInstanceFromDBSnapshotInput{
+		DBSnapshotIdentifier:    aws.String(snapshotARN),
+		DBInstanceIdentifier:    aws.String(dbr),
+		PubliclyAccessible:      aws.Bool(true),
+		DBInstanceClass:         aws.String(dbType),
+		MultiAZ:                 aws.Bool(false),
+		VpcSecurityGroupIds:     []string{securitygroup},
+		DBParameterGroupName:    aws.String(dbparametergroup),
+		AutoMinorVersionUpgrade: aws.Bool(false),
+	})
+	return wrapRDSError(err)
+}
+
+func waitDBInstanceDeleted(ctx context.Context, dbr string, cfg aws.Config) error {
+	svc := rds.NewFromConfig(cfg)
+	waiter := rds.NewDBInstanceDeletedWaiter(svc)
+	err := waiter.Wait(ctx, &rds.DescribeDBInstancesInput{
+		DBInstanceIdentifier: aws.String(dbr),
+	}, 60*time.Minute)
+	return wrapRDSError(err)
+}
+
+func waitDBInstanceAvailable(ctx context.Context, dbr string, waitingDbTimeInMinutes int, cfg aws.Config) error {
+	svc := rds.NewFromConfig(cfg)
+	waiter := rds.NewDBInstanceAvailableWaiter(svc, func(o *rds.DBInstanceAvailableWaiterOptions) {
+		o.MinDelay = 30 * time.Second
+		o.MaxDelay = 30 * time.Second
+	})
+	err := waiter.Wait(ctx, &rds.DescribeDBInstancesInput{
+		DBInstanceIdentifier: aws.String(dbr),
+	}, time.Duration(waitingDbTimeInMinutes)*time.Minute)
+	return wrapRDSError(err)
+}
+
+func deleteRestoredDBInstance(ctx context.Context, dbr string, cfg aws.Config) (bool, error) {
+	svc := rds.NewFromConfig(cfg)
+	_, err := svc.DeleteDBInstance(ctx, &rds.DeleteDBInstanceInput{
 		DBInstanceIdentifier: aws.String(dbr),
 		SkipFinalSnapshot:    aws.Bool(true),
-	}
-
-	_, err := svc.DeleteDBInstance(deleteinput)
+	})
 	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			printError(aerr.Error())
-		} else {
-			printError(err.Error())
-		}
-		return false, err
+		return false, wrapRDSError(err)
 	}
 	return true, nil
 }
 
-//Restores database
-func restoreDBInstanceToPointInTime(db string, dbr string, region string, dbType string, securitygroup string, dbparametergroup string) (bool, error) {
-	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
-	now := time.Now()
-	nowSubstractTenMinutes := now.Add(-10 * time.Minute)
-	input := &rds.RestoreDBInstanceToPointInTimeInput{
-		RestoreTime:                aws.Time(nowSubstractTenMinutes),
+func restoreDBInstanceToPointInTime(ctx context.Context, db, dbr, dbType, securitygroup, dbparametergroup string, cfg aws.Config) (bool, error) {
+	svc := rds.NewFromConfig(cfg)
+	nowSubtractTenMinutes := time.Now().Add(-10 * time.Minute)
+	_, err := svc.RestoreDBInstanceToPointInTime(ctx, &rds.RestoreDBInstanceToPointInTimeInput{
+		RestoreTime:                aws.Time(nowSubtractTenMinutes),
 		SourceDBInstanceIdentifier: aws.String(db),
 		TargetDBInstanceIdentifier: aws.String(dbr),
 		PubliclyAccessible:         aws.Bool(true),
 		DBInstanceClass:            aws.String(dbType),
 		MultiAZ:                    aws.Bool(false),
-		VpcSecurityGroupIds:        aws.StringSlice([]string{securitygroup}),
+		VpcSecurityGroupIds:        []string{securitygroup},
 		DBParameterGroupName:       aws.String(dbparametergroup),
 		AutoMinorVersionUpgrade:    aws.Bool(false),
-	}
-
-	_, err := svc.RestoreDBInstanceToPointInTime(input)
+	})
 	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			printError(aerr.Error())
-		} else {
-			printError(err.Error())
-		}
-		return false, err
+		return false, wrapRDSError(err)
 	}
 	return true, nil
 }
 
-//Change rds instance type (change master user password and disable backups)
-func changeDBInstance(dbr string, region string, restoredmasterpassword string) error {
-	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
-	input := &rds.ModifyDBInstanceInput{
+func changeDBInstance(ctx context.Context, dbr, restoredmasterpassword string, cfg aws.Config) error {
+	svc := rds.NewFromConfig(cfg)
+	_, err := svc.ModifyDBInstance(ctx, &rds.ModifyDBInstanceInput{
 		DBInstanceIdentifier:  aws.String(dbr),
 		ApplyImmediately:      aws.Bool(true),
-		BackupRetentionPeriod: aws.Int64(0), // prevent backups
+		BackupRetentionPeriod: aws.Int32(0), // prevent backups
 		MasterUserPassword:    aws.String(restoredmasterpassword),
-	}
-
-	_, err := svc.ModifyDBInstance(input)
+	})
 	time.Sleep(15 * time.Second)
-	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			printError(aerr.Error())
-		} else {
-			printError(err.Error())
-		}
-		return err
-	}
-	return nil
+	return wrapRDSError(err)
 }
 
-func restartDBInstance(dbr string, region string) error {
-	svc := rds.New(session.New(), &aws.Config{Region: aws.String(region)})
-	input := &rds.RebootDBInstanceInput{
+func restartDBInstance(ctx context.Context, dbr string, cfg aws.Config) error {
+	svc := rds.NewFromConfig(cfg)
+	_, err := svc.RebootDBInstance(ctx, &rds.RebootDBInstanceInput{
 		DBInstanceIdentifier: aws.String(dbr),
 		ForceFailover:        aws.Bool(false),
-	}
-	_, err := svc.RebootDBInstance(input)
+	})
 	time.Sleep(15 * time.Second)
-	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			printError(aerr.Error())
-		} else {
-			printError(err.Error())
-		}
-		return err
+	return wrapRDSError(err)
+}
+
+// wrapRDSError extracts a meaningful message from smithy/RDS errors.
+func wrapRDSError(err error) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return fmt.Errorf("%s: %s", apiErr.ErrorCode(), apiErr.ErrorMessage())
+	}
+	// Unwrap ResourceNotFoundFault so callers can detect missing instances
+	var notFound *rdstypes.DBInstanceNotFoundFault
+	if errors.As(err, &notFound) {
+		return notFound
+	}
+	return err
 }
 
 func printError(a ...interface{}) {
