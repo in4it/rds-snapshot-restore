@@ -1,7 +1,7 @@
 #
 # Build go project
 #
-FROM golang:1.15-alpine as go-builder
+FROM golang:1.26-alpine AS go-builder
 
 WORKDIR /build
 
@@ -16,7 +16,7 @@ RUN apk add -u -t build-tools curl git && \
 # Runtime container
 #
 
-FROM golang:alpine 
+FROM golang:1.26-alpine
 RUN mkdir /app
 COPY --from=go-builder /build/rds-snapshot-restore /app
 ADD entrypoint.sh /app
