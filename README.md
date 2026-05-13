@@ -6,7 +6,7 @@ Automates the AWS RDS restore process using point-in-time recovery (same account
 
 **Same-account restore** (default) uses `RestoreDBInstanceToPointInTime` to create a copy of the source DB from 10 minutes ago. This is the original behavior — no new flags are required and existing usage is unaffected.
 
-**Cross-account restore** is opt-in via the `-target-role-arn` flag. When provided, the tool creates a manual snapshot, shares it with the target account, assumes the given IAM role, and restores from the snapshot there.
+**Cross-account restore** is opt-in via the `-target-role-arn` flag. When provided, the tool creates a manual snapshot, shares it with the target account, assumes the given IAM role, and restores from the snapshot there. IF no default VPC is used we must provide `-dbSubnetGroup` as well.
 
 ---
 
@@ -36,7 +36,8 @@ AWS_PROFILE=source-account-profile go run rds_restore.go \
   -restoredmasterpassword=yourpassword \
   -dbparametergroup=your-param-group \
   -dbtype=db.t3.medium \
-  -target-role-arn=arn:aws:iam::123456789012:role/RDSRestoreRole
+  -target-role-arn=arn:aws:iam::123456789012:role/RDSRestoreRole \
+  -dbSubnetGroup=mydb-subnetgroup
 ```
 
 The credentials from `AWS_PROFILE` are used for the source account. The tool assumes `target-role-arn` to perform all operations in the target account.
@@ -71,7 +72,7 @@ docker run --rm \
   rds-snapshot-restore
 ```
 
-**Cross-account** — add `targetRoleARN`, no other changes needed:
+**Cross-account** — add `targetRoleARN` and `-dbSubnetGroup` if no default VPC is used, no other changes needed:
 
 ```bash
 docker run --rm \
@@ -83,6 +84,7 @@ docker run --rm \
   -e dbparametergroup=your-param-group \
   -e type=db.t3.medium \
   -e targetRoleARN=arn:aws:iam::123456789012:role/RDSRestoreRole \
+  -e dbSubnetGroup=mydb-subnetgroup \
   rds-snapshot-restore
 ```
 
@@ -98,6 +100,7 @@ docker run --rm \
 | `dbparametergroup` | Yes | Parameter group name for the restored instance |
 | `type` | Yes | DB instance class (e.g. `db.t3.medium`) |
 | `targetRoleARN` | No | IAM role ARN in the target account for cross-account restore |
+| `dbSubnetGroup` | No | DB Subnet Group used for cross-account restore if no default VPC is used |
 | `waitingDbTimeInMinutes` | No | Max minutes to wait for instance availability (default: 35) |
 
 ---
@@ -114,7 +117,9 @@ docker run --rm \
 | `-dbparametergroup` | Yes | Parameter group name for the restored instance |
 | `-dbtype` | Yes | DB instance class (e.g. `db.t3.medium`) |
 | `-target-role-arn` | No | IAM role ARN in the target account for cross-account restore |
+| `dbSubnetGroup` | No | DB Subnet Group used for cross-account restore if no default VPC is used |
 | `-waitingDbTimeInMinutes` | No | Max minutes to wait for instance availability (default: 35) |
+
 
 ---
 

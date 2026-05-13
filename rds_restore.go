@@ -33,6 +33,7 @@ func run() int {
 		dbType                 string
 		waitingDbTimeInMinutes int
 		targetRoleARN          string
+		dbSubnetGroup          string
 	)
 	const defaultWaitingDbTimeInMinutes = 35 // the default RDS backup duration is 30 minutes. Hence, we need to wait a bit more than 30 minutes
 	flag.StringVar(&databaseName, "database", "", "The source database")
@@ -44,6 +45,7 @@ func run() int {
 	flag.StringVar(&dbType, "dbtype", "", "The desired db type of the restored RDS")
 	flag.IntVar(&waitingDbTimeInMinutes, "waitingDbTimeInMinutes", defaultWaitingDbTimeInMinutes, "The desired waiting time in minutes for the restored RDS. This is required to apply the changes to the restored RDS")
 	flag.StringVar(&targetRoleARN, "target-role-arn", "", "IAM role ARN in the target account to assume for cross-account restore (e.g. arn:aws:iam::123456789012:role/RDSRestoreRole)")
+	flag.StringVar(&dbSubnetGroup, "dbSubnetGroup", "", "DB subnet group for restore (required for cross-account restore)")
 
 	flag.Parse()
 
@@ -78,7 +80,7 @@ func run() int {
 	}
 
 	if targetRoleARN != "" {
-		return runCrossAccount(ctx, databaseName, restoreTargetDatabase, dbType, securitygroup, dbparametergroup, restoredmasterpassword, targetRoleARN, waitingDbTimeInMinutes, sourceCfg)
+		return runCrossAccount(ctx, databaseName, restoreTargetDatabase, dbType, securitygroup, dbparametergroup, restoredmasterpassword, targetRoleARN, waitingDbTimeInMinutes, dbSubnetGroup, sourceCfg)
 	}
 
 	return runSameAccount(ctx, databaseName, restoreTargetDatabase, dbType, securitygroup, dbparametergroup, restoredmasterpassword, waitingDbTimeInMinutes, sourceCfg)
@@ -137,7 +139,7 @@ func runSameAccount(ctx context.Context, db, dbr, dbType, securitygroup, dbparam
 
 // runCrossAccount creates a manual snapshot in the source account, shares it with the
 // target account, assumes the target role, and restores the DB there.
-func runCrossAccount(ctx context.Context, db, dbr, dbType, securitygroup, dbparametergroup, restoredmasterpassword, targetRoleARN string, waitingDbTimeInMinutes int, sourceCfg aws.Config) int {
+func runCrossAccount(ctx context.Context, db, dbr, dbType, securitygroup, dbparametergroup, restoredmasterpassword, targetRoleARN string, waitingDbTimeInMinutes int, dbSubnetGroup string, sourceCfg aws.Config) int {
 	targetAccountID, err := accountIDFromRoleARN(targetRoleARN)
 	if err != nil {
 		printError(err)
@@ -197,7 +199,7 @@ func runCrossAccount(ctx context.Context, db, dbr, dbType, securitygroup, dbpara
 	}
 
 	printInfo("Restoring DB from shared snapshot in target account")
-	if err = restoreDBInstanceFromSnapshot(ctx, snapshotARN, dbr, dbType, securitygroup, dbparametergroup, targetCfg); err != nil {
+	if err = restoreDBInstanceFromSnapshot(ctx, snapshotARN, dbr, dbType, securitygroup, dbparametergroup, dbSubnetGroup, targetCfg); err != nil {
 		printError(err)
 		return 1
 	}
@@ -279,9 +281,10 @@ func shareDBSnapshot(ctx context.Context, snapshotID, targetAccountID string, cf
 	return wrapRDSError(err)
 }
 
-func restoreDBInstanceFromSnapshot(ctx context.Context, snapshotARN, dbr, dbType, securitygroup, dbparametergroup string, cfg aws.Config) error {
+func restoreDBInstanceFromSnapshot(ctx context.Context, snapshotARN, dbr, dbType, securitygroup, dbparametergroup string, dbSubnetGroup string, cfg aws.Config) error {
 	svc := rds.NewFromConfig(cfg)
-	_, err := svc.RestoreDBInstanceFromDBSnapshot(ctx, &rds.RestoreDBInstanceFromDBSnapshotInput{
+
+	input := &rds.RestoreDBInstanceFromDBSnapshotInput{
 		DBSnapshotIdentifier:    aws.String(snapshotARN),
 		DBInstanceIdentifier:    aws.String(dbr),
 		PubliclyAccessible:      aws.Bool(true),
@@ -290,7 +293,15 @@ func restoreDBInstanceFromSnapshot(ctx context.Context, snapshotARN, dbr, dbType
 		VpcSecurityGroupIds:     []string{securitygroup},
 		DBParameterGroupName:    aws.String(dbparametergroup),
 		AutoMinorVersionUpgrade: aws.Bool(false),
-	})
+	}
+
+	// DB subnet group is needed for cross-account restore, if no default VPC will be used
+	if dbSubnetGroup != "" {
+		input.DBSubnetGroupName = aws.String(dbSubnetGroup)
+	}
+
+	_, err := svc.RestoreDBInstanceFromDBSnapshot(ctx, input)
+
 	return wrapRDSError(err)
 }
 
